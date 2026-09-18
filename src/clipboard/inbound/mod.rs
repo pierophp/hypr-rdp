@@ -27,28 +27,52 @@ pub(super) struct InboundHandle {
 }
 
 impl InboundHandle {
-    pub(super) fn invalidate(&self) {
-        let _ = self.invalidate_selection();
+    /// Supersedes the advertised selection. Whatever was already mounted keeps
+    /// serving its open handles until its lock is released.
+    pub(super) fn retire(&self) {
+        let _ = self.retire_selection();
     }
 
-    fn invalidate_selection(&self) -> Option<u64> {
-        let generation = self.transfer.invalidate_generation();
+    fn retire_selection(&self) -> Option<u64> {
+        let (generation, released) = self.transfer.retire_generation();
+        self.drop_unpublished_files();
+        #[cfg(feature = "client-to-server")]
+        self.update_service(None, released, false);
+        #[cfg(not(feature = "client-to-server"))]
+        let _ = released;
+        generation
+    }
+
+    /// IronRDP sent the `Unlock` for these clipboard-data locks, so the remote
+    /// may drop their bytes: the selections they covered stop serving.
+    pub(super) fn release_locks(&self, data_ids: &[u32]) {
+        let released = self.transfer.release_locks(data_ids);
+        if released.is_empty() {
+            return;
+        }
+        #[cfg(feature = "client-to-server")]
+        self.update_service(None, released, false);
+    }
+
+    fn drop_unpublished_files(&self) {
         if let Ok(mut pending) = self.pending.lock() {
             if matches!(*pending, Some(PendingWrite::Files { .. })) {
                 *pending = None;
             }
         }
-        #[cfg(feature = "client-to-server")]
-        self.update_service(None, false);
-        generation
     }
 
     #[cfg(feature = "client-to-server")]
-    fn update_service(&self, job: Option<Job>, close: bool) {
+    fn update_service(&self, job: Option<Job>, release: Vec<u64>, close: bool) {
         let (state, changed) = &*self.service;
         if let Ok(mut state) = state.lock() {
             state.closed |= close;
-            state.job = job;
+            if job.is_some() {
+                state.job = job;
+            }
+            // Appended, never replaced: several retirements can pile up before
+            // the service thread next wakes.
+            state.release.extend(release);
             state.dirty = true;
             changed.notify_one();
         }
@@ -79,6 +103,7 @@ impl InboundClipboard {
                     closed: false,
                     dirty: false,
                     job: None,
+                    release: Vec::new(),
                 }),
                 Condvar::new(),
             )),
@@ -107,11 +132,18 @@ impl InboundClipboard {
         self.handle.transfer.generation()
     }
     pub(super) fn begin_remote_copy(&self) -> Option<u64> {
-        self.handle.invalidate_selection()
+        self.handle.retire_selection()
     }
     pub(super) fn set_capabilities(&self, stream: bool, huge: bool) {
-        self.handle.invalidate();
-        self.handle.transfer.capabilities(stream, huge);
+        self.handle.drop_unpublished_files();
+        let released = self.handle.transfer.capabilities(stream, huge);
+        #[cfg(feature = "client-to-server")]
+        self.handle.update_service(None, released, false);
+        #[cfg(not(feature = "client-to-server"))]
+        let _ = released;
+    }
+    pub(super) fn release_locks(&self, data_ids: &[u32]) {
+        self.handle.release_locks(data_ids);
     }
     pub(super) fn on_response(&self, response: FileContentsResponse<'_>) {
         self.handle.transfer.on_response(response);
@@ -130,11 +162,11 @@ impl InboundClipboard {
         data_id: Option<u32>,
     ) {
         #[cfg(feature = "client-to-server")]
-        if let Some((generation, roots)) =
+        if let Some((generation, roots, released)) =
             self.handle.transfer.accept_for(generation, files, data_id)
         {
             self.handle
-                .update_service(Some(Job { generation, roots }), false);
+                .update_service(Some(Job { generation, roots }), released, false);
         }
         #[cfg(not(feature = "client-to-server"))]
         let _ = (generation, files, data_id);
@@ -143,10 +175,12 @@ impl InboundClipboard {
 
 impl Drop for InboundClipboard {
     fn drop(&mut self) {
-        self.handle.transfer.close();
-        self.handle.invalidate();
+        let released = self.handle.transfer.close();
+        self.handle.drop_unpublished_files();
         #[cfg(feature = "client-to-server")]
-        self.handle.update_service(None, true);
+        self.handle.update_service(None, released, true);
+        #[cfg(not(feature = "client-to-server"))]
+        let _ = released;
     }
 }
 
@@ -160,6 +194,8 @@ struct Service {
     closed: bool,
     dirty: bool,
     job: Option<Job>,
+    /// Generations whose mount must come down.
+    release: Vec<u64>,
 }
 
 #[cfg(feature = "client-to-server")]
@@ -178,10 +214,12 @@ fn serve<M: Mounted>(
     handle: InboundHandle,
     mut create: impl FnMut(filesystem::RemoteFilesystem) -> Option<M>,
 ) {
-    let mut mounted = None;
+    // One mount per selection that is still serving: the live one, plus every
+    // retired one whose clipboard-data lock the remote still honours.
+    let mut mounted: std::collections::HashMap<u64, M> = std::collections::HashMap::new();
     loop {
         let (state, changed) = &*handle.service;
-        let job = {
+        let (job, release) = {
             let Ok(state) = state.lock() else { break };
             let Ok(mut state) = changed.wait_while(state, |state| !state.dirty && !state.closed)
             else {
@@ -191,11 +229,18 @@ fn serve<M: Mounted>(
                 break;
             }
             state.dirty = false;
-            state.job.take()
+            (state.job.take(), core::mem::take(&mut state.release))
         };
-        drop(mounted.take());
+        for generation in release {
+            drop(mounted.remove(&generation));
+        }
         let Some(job) = job else { continue };
-        if job.roots.is_empty() || handle.transfer.with_tree(job.generation, |_| ()).is_none() {
+        if job.roots.is_empty()
+            || handle
+                .transfer
+                .with_live_tree(job.generation, |_| ())
+                .is_none()
+        {
             continue;
         }
         let filesystem = filesystem::RemoteFilesystem::new(handle.transfer.clone(), job.generation);
@@ -203,10 +248,10 @@ fn serve<M: Mounted>(
             continue;
         };
         // Creation may block while a new copy, local owner change, or close arrives.
-        // Only the same live generation can publish its newly created path.
+        // Only the still-live generation can publish its newly created path.
         let published = handle
             .transfer
-            .with_tree(job.generation, |_| {
+            .with_live_tree(job.generation, |_| {
                 let Some(payload) = uri_payload(mount.path(), &job.roots) else {
                     return false;
                 };
@@ -218,7 +263,7 @@ fn serve<M: Mounted>(
             })
             .unwrap_or(false);
         if published {
-            mounted = Some(mount);
+            mounted.insert(job.generation, mount);
         }
     }
     // M's destructor runs here, never on a protocol callback or Wayland watcher.
@@ -278,6 +323,7 @@ mod tests {
                         closed: false,
                         dirty: false,
                         job: None,
+                        release: Vec::new(),
                     }),
                     Condvar::new(),
                 )),
@@ -310,7 +356,7 @@ mod tests {
                 drop(clipboard);
                 None
             } else {
-                clipboard.handle.invalidate();
+                clipboard.handle.retire();
                 Some(clipboard)
             };
             release.send(()).unwrap();

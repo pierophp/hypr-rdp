@@ -438,6 +438,17 @@ impl CliprdrBackend for HyprCliprdrBackend {
     fn on_lock(&mut self, _data_id: LockDataId) {}
 
     fn on_unlock(&mut self, _data_id: LockDataId) {}
+
+    /// The `Unlock` for these locks has gone out, so the client is free to drop
+    /// the file data they covered. Whatever we were still serving from them
+    /// stops here rather than reading bytes the client no longer owes us.
+    fn on_outgoing_locks_cleared(&mut self, clip_data_ids: &[LockDataId]) {
+        let Some(inbound) = &self.inbound else {
+            return;
+        };
+        let released: Vec<u32> = clip_data_ids.iter().map(|id| id.0).collect();
+        inbound.release_locks(&released);
+    }
 }
 
 impl HyprCliprdrBackend {
@@ -782,7 +793,7 @@ mod tests {
                 backend.on_remote_copy(&[incoming_file_format(0xc002)]);
             }
             let handle = backend.inbound.as_ref().unwrap().handle();
-            handle.invalidate(); // The Wayland local-owner callback's production seam.
+            handle.retire(); // The Wayland local-owner callback's production seam.
             let generation = backend.inbound.as_ref().unwrap().generation();
             backend.on_remote_file_list(&[FileDescriptor::new("stale").with_file_size(1)], None);
             assert_eq!(
@@ -871,6 +882,9 @@ mod tests {
             }
             fn on_lock(&mut self, data_id: LockDataId) {
                 self.0.on_lock(data_id);
+            }
+            fn on_outgoing_locks_cleared(&mut self, ids: &[LockDataId]) {
+                self.0.on_outgoing_locks_cleared(ids);
             }
             fn on_unlock(&mut self, data_id: LockDataId) {
                 self.0.on_unlock(data_id);

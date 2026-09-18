@@ -218,7 +218,11 @@ impl ClipState {
     fn local_owner_changed(&self) {
         self.file_selection.clear();
         if let Some(inbound) = &self.inbound {
-            inbound.invalidate();
+            // Retire, not destroy: the desktop taking the clipboard says nothing
+            // about the client's, whose file list and lock are both still live.
+            // A paste already in progress keeps reading. Nothing on the remote
+            // expires here, so this selection leaves on the retirement ceiling.
+            inbound.retire();
         }
     }
 
